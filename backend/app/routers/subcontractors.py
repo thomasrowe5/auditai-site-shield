@@ -1,73 +1,102 @@
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from uuid import UUID
+from __future__ import annotations
+
 from datetime import datetime
-from app.db.session import SessionLocal
-from app.db import models
-from app.schemas import subcontractor as schemas
+from typing import Optional, List
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, EmailStr
+from sqlalchemy.orm import Session
+
+from app.db import models, session
 
 router = APIRouter(prefix="/subcontractors", tags=["Subcontractors"])
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+# ---------- Pydantic (minimal for create/update) ----------
+class SubcontractorCreate(BaseModel):
+    project_id: str
+    name: str
+    trade: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    status: Optional[str] = "active"
 
-def calculate_risk(sub):
-    today = datetime.utcnow()
-    expiring_fields = []
-    if sub.insurance_expiration and sub.insurance_expiration < today:
-        expiring_fields.append("Insurance expired")
-    if sub.license_expiration and sub.license_expiration < today:
-        expiring_fields.append("License expired")
-    if sub.safety_cert_expiration and sub.safety_cert_expiration < today:
-        expiring_fields.append("Safety cert expired")
+class SubcontractorUpdate(BaseModel):
+    name: Optional[str] = None
+    trade: Optional[str] = None
+    email: Optional[EmailStr] = None
+    phone: Optional[str] = None
+    status: Optional[str] = None
 
-    if expiring_fields:
-        return "❌ Non-compliant: " + ", ".join(expiring_fields)
-    return "✅ Compliant"
+# ---------- Endpoints ----------
+@router.post("/", summary="Create subcontractor")
+def create_subcontractor(payload: SubcontractorCreate, db: Session = Depends(session.get_db)):
+    new_sub = models.Subcontractor(
+        subcontractor_id=models.uuid_str(),  # helper in your models, or use str(uuid4())
+        project_id=payload.project_id,
+        name=payload.name,
+        trade=payload.trade,
+        email=payload.email,
+        phone=payload.phone,
+        status=payload.status or "active",
+        risk_status="✅ Compliant",
+        created_at=datetime.utcnow(),
+    )
+    db.add(new_sub)
+    db.commit()
+    db.refresh(new_sub)
+    return new_sub
 
-@router.post("/", response_model=schemas.SubcontractorOut)
-def create_subcontractor(data: schemas.SubcontractorCreate, db: Session = Depends(get_db)):
-    sub = models.Subcontractor(**data.model_dump())
-    db.add(sub)
+@router.get("", summary="List subcontractors for a project")
+@router.get("/", summary="List subcontractors for a project")
+def list_subcontractors(project_id: str, db: Session = Depends(session.get_db)):
+    return (
+        db.query(models.Subcontractor)
+        .filter(models.Subcontractor.project_id == project_id)
+        .all()
+    )
+
+@router.get("/{subcontractor_id}", summary="Get a subcontractor by id")
+def get_subcontractor(subcontractor_id: str, db: Session = Depends(session.get_db)):
+    sub = (
+        db.query(models.Subcontractor)
+        .filter(models.Subcontractor.subcontractor_id == subcontractor_id)
+        .first()
+    )
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subcontractor not found")
+    return sub
+
+@router.patch("/{subcontractor_id}", summary="Update subcontractor")
+def update_subcontractor(subcontractor_id: str, payload: SubcontractorUpdate, db: Session = Depends(session.get_db)):
+    sub = (
+        db.query(models.Subcontractor)
+        .filter(models.Subcontractor.subcontractor_id == subcontractor_id)
+        .first()
+    )
+    if not sub:
+        raise HTTPException(status_code=404, detail="Subcontractor not found")
+
+    if payload.name is not None: sub.name = payload.name
+    if payload.trade is not None: sub.trade = payload.trade
+    if payload.email is not None: sub.email = payload.email
+    if payload.phone is not None: sub.phone = payload.phone
+    if payload.status is not None: sub.status = payload.status
+
     db.commit()
     db.refresh(sub)
-    return schemas.SubcontractorOut(**sub.__dict__, risk_status=calculate_risk(sub))
+    return sub
 
-@router.get("/project/{project_id}", response_model=list[schemas.SubcontractorOut])
-def list_subcontractors(project_id: UUID, db: Session = Depends(get_db)):
-    subs = db.query(models.Subcontractor).filter(models.Subcontractor.project_id == project_id).all()
-    return [schemas.SubcontractorOut(**s.__dict__, risk_status=calculate_risk(s)) for s in subs]
-
-@router.get("/{subcontractor_id}", response_model=schemas.SubcontractorOut)
-def get_subcontractor(subcontractor_id: UUID, db: Session = Depends(get_db)):
-    sub = db.query(models.Subcontractor).filter(models.Subcontractor.subcontractor_id == subcontractor_id).first()
-    if not sub:
-        raise HTTPException(status_code=404, detail="Subcontractor not found")
-    return schemas.SubcontractorOut(**sub.__dict__, risk_status=calculate_risk(sub))
-
-@router.patch("/{subcontractor_id}", response_model=schemas.SubcontractorOut)
-def update_subcontractor(subcontractor_id: UUID, update: schemas.SubcontractorUpdate, db: Session = Depends(get_db)):
-    sub = db.query(models.Subcontractor).filter(models.Subcontractor.subcontractor_id == subcontractor_id).first()
+@router.delete("/{subcontractor_id}", summary="Delete subcontractor")
+def delete_subcontractor(subcontractor_id: str, db: Session = Depends(session.get_db)):
+    sub = (
+        db.query(models.Subcontractor)
+        .filter(models.Subcontractor.subcontractor_id == subcontractor_id)
+        .first()
+    )
     if not sub:
         raise HTTPException(status_code=404, detail="Subcontractor not found")
 
-    for key, value in update.model_dump(exclude_unset=True).items():
-        setattr(sub, key, value)
-
-    db.commit()
-    db.refresh(sub)
-    return schemas.SubcontractorOut(**sub.__dict__, risk_status=calculate_risk(sub))
-
-@router.delete("/{subcontractor_id}")
-def delete_subcontractor(subcontractor_id: UUID, db: Session = Depends(get_db)):
-    sub = db.query(models.Subcontractor).filter(models.Subcontractor.subcontractor_id == subcontractor_id).first()
-    if not sub:
-        raise HTTPException(status_code=404, detail="Subcontractor not found")
     db.delete(sub)
     db.commit()
-    return {"detail": "Subcontractor deleted successfully"}
+    return {"detail": "Subcontractor deleted"}
 
